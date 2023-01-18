@@ -12,6 +12,7 @@
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include <atomic>
+#include <thread>
 
 namespace Aws
 {
@@ -31,6 +32,7 @@ public:
 
     //Creates client, initializes curl handle if it hasn't been created already.
     CurlHttpClient(const Aws::Client::ClientConfiguration& clientConfig);
+    virtual ~CurlHttpClient();
 
     //Makes request and receives response synchronously
     std::shared_ptr<HttpResponse> MakeRequest(const std::shared_ptr<HttpRequest>& request,
@@ -67,6 +69,13 @@ private:
     bool m_disableExpectHeader;
     bool m_allowRedirects;
     static std::atomic<bool> isInit;
+
+
+    std::thread m_thread;
+    CURLM* m_multi = NULL;
+    std::atomic<bool> m_exit{false};
+
+    void worker_thread() noexcept;
 };
 
 using PlatformHttpClient = CurlHttpClient;

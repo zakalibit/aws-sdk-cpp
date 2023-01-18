@@ -547,25 +547,29 @@ CurlHttpClient::CurlHttpClient(const ClientConfiguration& clientConfig) :
         }
         m_nonProxyHosts = ss.str();
     }
+
+    m_multi = curl_multi_init();
+    m_thread = std::thread([this]() { this->worker_thread(); });
+}
+
+CurlHttpClient::~CurlHttpClient()
+{
+    m_exit.store(true);
+    if (m_multi) curl_multi_wakeup(m_multi);
+    if (m_thread.joinable()) m_thread.join();
+    if (m_multi) curl_multi_cleanup(m_multi);
 }
 
 
-std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<HttpRequest>& request,
-    Aws::Utils::RateLimits::RateLimiterInterface* readLimiter,
-    Aws::Utils::RateLimits::RateLimiterInterface* writeLimiter) const
-{
-    URI uri = request->GetUri();
-    Aws::String url = uri.GetURIString();
-    std::shared_ptr<HttpResponse> response = Aws::MakeShared<StandardHttpResponse>(CURL_HTTP_CLIENT_TAG, request);
-
-    AWS_LOGSTREAM_TRACE(CURL_HTTP_CLIENT_TAG, "Making request to " << url);
-    struct curl_slist* headers = NULL;
-
-    if (writeLimiter != nullptr)
-    {
-        writeLimiter->ApplyAndPayForCost(request->GetSize());
+struct CurlListDeleter {
+    void operator()(struct curl_slist* slist) {
+        curl_slist_free_all(slist);
     }
+};
 
+std::shared_ptr<curl_slist> MakeRequestHeaders(const std::shared_ptr<HttpRequest>& request, bool disableExpectHeader)
+{
+    struct curl_slist* headers = NULL;
     Aws::StringStream headerStream;
     HeaderValueCollection requestHeaders = request->GetHeaders();
 
@@ -579,36 +583,83 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
         headers = curl_slist_append(headers, headerString.c_str());
     }
 
-    if (!request->HasHeader(Http::TRANSFER_ENCODING_HEADER))
+    if (!request->HasHeader(Aws::Http::TRANSFER_ENCODING_HEADER))
     {
         headers = curl_slist_append(headers, "transfer-encoding:");
     }
 
-    if (!request->HasHeader(Http::CONTENT_LENGTH_HEADER))
+    if (!request->HasHeader(Aws::Http::CONTENT_LENGTH_HEADER))
     {
         headers = curl_slist_append(headers, "content-length:");
     }
 
-    if (!request->HasHeader(Http::CONTENT_TYPE_HEADER))
+    if (!request->HasHeader(Aws::Http::CONTENT_TYPE_HEADER))
     {
         headers = curl_slist_append(headers, "content-type:");
     }
 
     // Discard Expect header so as to avoid using multiple payloads to send a http request (header + body)
-    if (m_disableExpectHeader)
+    if (disableExpectHeader)
     {
         headers = curl_slist_append(headers, "Expect:");
     }
 
-    CURL* connectionHandle = m_curlHandleContainer.AcquireCurlHandle();
+    return std::shared_ptr<curl_slist>{headers, CurlListDeleter{}};
+}
+
+
+void CurlHttpClient::worker_thread() noexcept
+{
+    int still_running = 0;
+    int msgs_left = 0;
+    int num_fds = 0;
+    while (!m_exit || still_running) {
+        auto res = curl_multi_perform(m_multi, &still_running);
+        if (res == CURLM_OK) {
+            res = curl_multi_poll(m_multi, NULL, 0, 1000, &num_fds);
+		    if (res != CURLM_OK) break;
+        }
+
+        CURLMsg* msg;
+        while((msg = curl_multi_info_read(m_multi, &msgs_left))) {
+            if(msg->msg == CURLMSG_DONE) {
+                CURL *e = msg->easy_handle;
+                std::promise<CURLcode>* promise;
+                curl_easy_getinfo(e, CURLINFO_PRIVATE, &promise);
+                curl_multi_remove_handle(m_multi, e);
+                promise->set_value(msg->data.result);
+            }
+        }
+    }
+}
+
+std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<HttpRequest>& request,
+    Aws::Utils::RateLimits::RateLimiterInterface* readLimiter,
+    Aws::Utils::RateLimits::RateLimiterInterface* writeLimiter) const
+{
+    URI uri = request->GetUri();
+    Aws::String url = uri.GetURIString();
+    std::shared_ptr<HttpResponse> response = Aws::MakeShared<StandardHttpResponse>(CURL_HTTP_CLIENT_TAG, request);
+
+    AWS_LOGSTREAM_TRACE(CURL_HTTP_CLIENT_TAG, "Making request to " << url);
+
+    if (writeLimiter != nullptr)
+    {
+        writeLimiter->ApplyAndPayForCost(request->GetSize());
+    }
+
+
+    auto curlHandle = m_curlHandleContainer.AcquireCurlHandle();
+    auto connectionHandle = curlHandle.curl.get();
 
     if (connectionHandle)
     {
         AWS_LOGSTREAM_DEBUG(CURL_HTTP_CLIENT_TAG, "Obtained connection handle " << connectionHandle);
 
+        auto headers = MakeRequestHeaders(request, m_disableExpectHeader);
         if (headers)
         {
-            curl_easy_setopt(connectionHandle, CURLOPT_HTTPHEADER, headers);
+            curl_easy_setopt(connectionHandle, CURLOPT_HTTPHEADER, *headers);
         }
 
         CurlWriteCallbackContext writeContext(this, request.get(), response.get(), readLimiter);
@@ -728,7 +779,16 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
 
         OverrideOptionsOnConnectionHandle(connectionHandle);
         Aws::Utils::DateTime startTransmissionTime = Aws::Utils::DateTime::Now();
-        CURLcode curlResponseCode = curl_easy_perform(connectionHandle);
+
+        std::promise<CURLcode> promise;
+        auto future = promise.get_future();
+
+        curl_easy_setopt(connectionHandle, CURLOPT_PRIVATE, &promise);
+        curl_multi_add_handle(m_multi, connectionHandle);
+        //curl_multi_wakeup(m_multi)
+
+        CURLcode curlResponseCode = future.get();//curl_easy_perform(connectionHandle);
+
         bool shouldContinueRequest = ContinueRequest(*request);
         if (curlResponseCode != CURLE_OK && shouldContinueRequest)
         {
@@ -805,20 +865,15 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
         }
         if (curlResponseCode != CURLE_OK)
         {
-            m_curlHandleContainer.DestroyCurlHandle(connectionHandle);
+            m_curlHandleContainer.DestroyCurlHandle(curlHandle);
         }
         else
         {
-            m_curlHandleContainer.ReleaseCurlHandle(connectionHandle);
+            m_curlHandleContainer.ReleaseCurlHandle(curlHandle);
         }
         //go ahead and flush the response body stream
         response->GetResponseBody().flush();
         request->AddRequestMetric(GetHttpClientMetricNameByType(HttpClientMetricsType::RequestLatency), (DateTime::Now() - startTransmissionTime).count());
-    }
-
-    if (headers)
-    {
-        curl_slist_free_all(headers);
     }
 
     return response;

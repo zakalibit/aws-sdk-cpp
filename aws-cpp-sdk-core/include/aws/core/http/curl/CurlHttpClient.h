@@ -13,6 +13,7 @@
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include <atomic>
 #include <thread>
+#include <queue>
 
 namespace Aws
 {
@@ -75,6 +76,7 @@ private:
     CURLM* m_multi = NULL;
     std::atomic<bool> m_exit{false};
     mutable std::mutex m_mtx;
+    mutable std::queue<CURL*> m_multiQ;
 
     void worker_thread() noexcept;
 };

@@ -614,35 +614,39 @@ void CurlHttpClient::worker_thread() noexcept
     int still_running = 0;
     int msgs_left = 0;
     int num_fds = 0;
-    while (!m_exit || still_running) {
+    while (!m_exit) {
         {
             std::lock_guard<std::mutex> lck(m_mtx);
-            auto res = curl_multi_perform(m_multi, &still_running);
-//        std::cerr << "curl_multi_perform res: " << res << " still_running: " << still_running << std::endl;
-    		if (res != CURLM_OK) {
-                AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_perform error: " << curl_multi_strerror(res));
-                break;
+            while (!m_multiQ.empty()) {
+                CURL* ehandle = m_multiQ.front();
+                curl_multi_add_handle(m_multi, ehandle);
+                m_multiQ.pop();
             }
-            if (m_exit && !still_running) break;
+        }
+        auto res = curl_multi_perform(m_multi, &still_running);
+//        std::cerr << "curl_multi_perform res: " << res << " still_running: " << still_running << std::endl;
+    	if (res != CURLM_OK) {
+            AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_perform error: " << curl_multi_strerror(res));
+            break;
+        }
+        if (m_exit && !still_running) break;
 
-            CURLMsg* msg;
-            while((msg = curl_multi_info_read(m_multi, &msgs_left))) {
+        CURLMsg* msg;
+         while((msg = curl_multi_info_read(m_multi, &msgs_left))) {
     //            std::cerr << "curl_multi_info_read msg: " << msg->msg <<  std::endl;
-                if(msg->msg == CURLMSG_DONE) {
-                    CURL *e = msg->easy_handle;
-                    CURLcode result = msg->data.result;
+            if(msg->msg == CURLMSG_DONE) {
+                CURL *e = msg->easy_handle;
+                CURLcode result = msg->data.result;
 
     //                std::cerr << "curl_multi_info_read done result: " << result << std::endl;
-                    std::promise<CURLcode>* promise;
-                    curl_easy_getinfo(e, CURLINFO_PRIVATE, &promise);
-                    curl_multi_remove_handle(m_multi, e);
-                    promise->set_value(result);
-                }
+                std::promise<CURLcode>* promise;
+                curl_easy_getinfo(e, CURLINFO_PRIVATE, &promise);
+                curl_multi_remove_handle(m_multi, e);
+                promise->set_value(result);
             }
-
         }
 
-        auto res = curl_multi_poll(m_multi, NULL, 0, 1000, &num_fds);
+        res = curl_multi_poll(m_multi, NULL, 0, 1000, &num_fds);
 //        std::cerr << "curl_multi_poll res: " << res << " num_fds: "<< num_fds << std::endl;
 		if (res != CURLM_OK) {
             AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_poll error: " << curl_multi_strerror(res));
@@ -805,7 +809,7 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
         curl_easy_setopt(connectionHandle, CURLOPT_PRIVATE, &promise);
         {
             std::lock_guard<std::mutex> lck(m_mtx);
-            curl_multi_add_handle(m_multi, connectionHandle);
+            m_multiQ.push(connectionHandle);
         }
         curl_multi_wakeup(m_multi);
 

@@ -74,6 +74,7 @@ private:
     std::thread m_thread;
     CURLM* m_multi = NULL;
     std::atomic<bool> m_exit{false};
+    mutable std::mutex m_mtx;
 
     void worker_thread() noexcept;
 };

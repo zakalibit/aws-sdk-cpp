@@ -18,6 +18,7 @@ namespace Http
 
 struct CurlHandle {
   std::shared_ptr<CURL> curl;
+  std::shared_ptr<void> ctx;
 };
 
 

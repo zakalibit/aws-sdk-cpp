@@ -12,6 +12,7 @@
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include <atomic>
+#include <queue>
 
 namespace Aws
 {
@@ -31,6 +32,7 @@ public:
 
     //Creates client, initializes curl handle if it hasn't been created already.
     CurlHttpClient(const Aws::Client::ClientConfiguration& clientConfig);
+    virtual ~CurlHttpClient();
 
     //Makes request and receives response synchronously
     std::shared_ptr<HttpResponse> MakeRequest(const std::shared_ptr<HttpRequest>& request,

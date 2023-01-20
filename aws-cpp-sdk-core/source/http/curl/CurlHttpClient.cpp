@@ -16,7 +16,7 @@
 #include <aws/core/monitoring/HttpClientMetrics.h>
 #include <cassert>
 #include <algorithm>
-
+#include <future>
 
 using namespace Aws::Client;
 using namespace Aws::Http;
@@ -598,10 +598,10 @@ void CurlHttpClient::multi_reactor() const noexcept
         if(msg->msg == CURLMSG_DONE) {
             CURL *e = msg->easy_handle;
             CURLcode result = msg->data.result;
-            RequestCtx* ctx;
-            curl_easy_getinfo(e, CURLINFO_PRIVATE, &ctx);
+            std::promise<CURLcode>* promise;
+            curl_easy_getinfo(e, CURLINFO_PRIVATE, &promise);
             curl_multi_remove_handle(m_multi, e);
-            ctx->promise.set_value(result);
+            promise->set_value(result);
         }
     }
 }
@@ -787,7 +787,7 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
         Aws::Utils::DateTime startTransmissionTime = Aws::Utils::DateTime::Now();
 
         std::promise<CURLcode> promise;
-        auto future = promise.get_future()
+        auto future = promise.get_future();
 
         curl_easy_setopt(connectionHandle, CURLOPT_PRIVATE, &promise);
         {

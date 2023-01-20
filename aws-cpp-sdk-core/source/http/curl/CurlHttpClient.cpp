@@ -558,8 +558,53 @@ CurlHttpClient::CurlHttpClient(const ClientConfiguration& clientConfig) :
         }
         m_nonProxyHosts = ss.str();
     }
+
+    m_multi = curl_multi_init();
 }
 
+CurlHttpClient::~CurlHttpClient()
+{
+    if (m_multi) curl_multi_cleanup(m_multi);
+}
+
+void CurlHttpClient::multi_reactor() const noexcept
+{
+    int still_running = 0;
+    int msgs_left = 0;
+    int num_fds = 0;
+
+    auto res = curl_multi_poll(m_multi, NULL, 0, 1000, &num_fds);
+	if (res != CURLM_OK) {
+        AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_poll error: " << curl_multi_strerror(res));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lck(m_mtxQ);
+        while (!m_multiQ.empty()) {
+            CURL* ehandle = m_multiQ.front();
+            curl_multi_add_handle(m_multi, ehandle);
+            m_multiQ.pop();
+        }
+    }
+
+    res = curl_multi_perform(m_multi, &still_running);
+    if (res != CURLM_OK) {
+        AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_perform error: " << curl_multi_strerror(res));
+        return;
+    }
+
+    CURLMsg* msg;
+    while((msg = curl_multi_info_read(m_multi, &msgs_left))) {
+        if(msg->msg == CURLMSG_DONE) {
+            CURL *e = msg->easy_handle;
+            CURLcode result = msg->data.result;
+            RequestCtx* ctx;
+            curl_easy_getinfo(e, CURLINFO_PRIVATE, &ctx);
+            curl_multi_remove_handle(m_multi, e);
+            ctx->promise.set_value(result);
+        }
+    }
+}
 
 std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<HttpRequest>& request,
     Aws::Utils::RateLimits::RateLimiterInterface* readLimiter,
@@ -740,7 +785,31 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
 
         OverrideOptionsOnConnectionHandle(connectionHandle);
         Aws::Utils::DateTime startTransmissionTime = Aws::Utils::DateTime::Now();
-        CURLcode curlResponseCode = curl_easy_perform(connectionHandle);
+
+        std::promise<CURLcode> promise;
+        auto future = promise.get_future()
+
+        curl_easy_setopt(connectionHandle, CURLOPT_PRIVATE, &promise);
+        {
+            std::lock_guard<std::mutex> lck(m_mtxQ);
+            m_multiQ.push(connectionHandle);
+        }
+
+        do {
+            if (m_mtxR.try_lock()) {
+                std::lock_guard<std::recursive_mutex> rk(m_mtxR);
+                //now lock_guard owns it
+                m_mtxR.unlock();
+                do {
+                    multi_reactor();
+                } while (std::future_status::ready != future.wait_for(std::chrono::seconds(0)));
+            } else {
+                curl_multi_wakeup(m_multi);
+            }
+        } while (std::future_status::ready != future.wait_for(std::chrono::milliseconds(100)));
+
+        CURLcode curlResponseCode = future.get();//curl_easy_perform(connectionHandle);
+
         bool shouldContinueRequest = ContinueRequest(*request);
         if (curlResponseCode != CURLE_OK && shouldContinueRequest)
         {

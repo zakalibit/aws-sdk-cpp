@@ -67,6 +67,14 @@ private:
     bool m_disableExpectHeader;
     bool m_allowRedirects;
     static std::atomic<bool> isInit;
+
+
+    CURLM* m_multi = NULL;
+    mutable std::mutex m_mtxQ;
+    mutable std::recursive_mutex m_mtxR;
+    mutable std::queue<CURL*> m_multiQ;
+
+    void multi_reactor() const noexcept;
 };
 
 using PlatformHttpClient = CurlHttpClient;

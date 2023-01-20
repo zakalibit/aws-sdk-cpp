@@ -17,10 +17,11 @@ namespace Http
 {
 
 struct CurlHandle {
+  CurlHandle() = default;
+  CurlHandle& operator=(const CurlHandle& other) = delete;
   std::shared_ptr<CURL> curl;
-  std::shared_ptr<void> ctx;
+  void* ctx = nullptr;
 };
-
 
 /**
   * Simple Connection pool manager for Curl. It maintains connections in a thread safe manner. You
@@ -42,17 +43,17 @@ public:
     /**
       * Blocks until a curl handle from the pool is available for use.
       */
-    CurlHandle AcquireCurlHandle();
+    CurlHandle* AcquireCurlHandle();
     /**
       * Returns a handle to the pool for reuse. It is imperative that this is called
       * after you are finished with the handle.
       */
-    void ReleaseCurlHandle(CurlHandle handle);
+    void ReleaseCurlHandle(CurlHandle* handle);
 
     /**
      * When the handle has bad DNS entries, problematic live connections, we need to destroy the handle from pool.
      */
-    void DestroyCurlHandle(CurlHandle handle);
+    void DestroyCurlHandle(CurlHandle* handle);
 
 private:
     CurlHandleContainer(const CurlHandleContainer&) = delete;
@@ -60,11 +61,11 @@ private:
     CurlHandleContainer(const CurlHandleContainer&&) = delete;
     const CurlHandleContainer& operator = (const CurlHandleContainer&&) = delete;
 
-    CurlHandle CreateCurlHandleInPool();
+    CurlHandle* CreateCurlHandleInPool();
     bool CheckAndGrowPool();
     void SetDefaultOptionsOnHandle(CURL* handle);
 
-    Aws::Utils::ExclusiveOwnershipResourceManager<CurlHandle> m_handleContainer;
+    Aws::Utils::ExclusiveOwnershipResourceManager<CurlHandle*> m_handleContainer;
     unsigned m_maxPoolSize;
     unsigned long m_httpRequestTimeout;
     unsigned long m_connectTimeout;

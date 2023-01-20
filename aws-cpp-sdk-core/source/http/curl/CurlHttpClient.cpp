@@ -16,6 +16,7 @@
 #include <aws/core/monitoring/HttpClientMetrics.h>
 #include <cassert>
 #include <algorithm>
+#include <thread>
 
 
 using namespace Aws::Client;
@@ -151,7 +152,7 @@ static size_t WriteData(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
     if (ptr)
     {
-        RequestCtx* context = reinterpret_cast<RequestCtx*>(userdata);
+        struct RequestCtx* context = reinterpret_cast<RequestCtx*>(userdata);
 
         const CurlHttpClient* client = context->client;
         if(!client->ContinueRequest(*context->request) || !client->IsRequestProcessingEnabled())
@@ -595,11 +596,10 @@ std::shared_ptr<curl_slist> MakeRequestHeaders(const std::shared_ptr<HttpRequest
 
 void CurlHttpClient::worker_thread() noexcept
 {
- //   std::cerr << "Entering CurlHttpClient::worker_thread()" << std::endl;
     int still_running = 0;
     int msgs_left = 0;
     int num_fds = 0;
-    while (!m_exit) {
+    while (!m_exit.load() || still_running) {
         {
             std::lock_guard<std::mutex> lck(m_mtx);
             while (!m_multiQ.empty()) {
@@ -609,7 +609,6 @@ void CurlHttpClient::worker_thread() noexcept
             }
         }
         auto res = curl_multi_perform(m_multi, &still_running);
-//        std::cerr << "curl_multi_perform res: " << res << " still_running: " << still_running << std::endl;
     	if (res != CURLM_OK) {
             AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_perform error: " << curl_multi_strerror(res));
             break;
@@ -618,27 +617,22 @@ void CurlHttpClient::worker_thread() noexcept
 
         CURLMsg* msg;
          while((msg = curl_multi_info_read(m_multi, &msgs_left))) {
-    //            std::cerr << "curl_multi_info_read msg: " << msg->msg <<  std::endl;
             if(msg->msg == CURLMSG_DONE) {
                 CURL *e = msg->easy_handle;
                 CURLcode result = msg->data.result;
-
-    //                std::cerr << "curl_multi_info_read done result: " << result << std::endl;
-                std::promise<CURLcode>* promise;
-                curl_easy_getinfo(e, CURLINFO_PRIVATE, &promise);
+                RequestCtx* ctx;
+                curl_easy_getinfo(e, CURLINFO_PRIVATE, &ctx);
                 curl_multi_remove_handle(m_multi, e);
-                promise->set_value(result);
+                ctx->promise.set_value(result);
             }
         }
 
         res = curl_multi_poll(m_multi, NULL, 0, 1000, &num_fds);
-//        std::cerr << "curl_multi_poll res: " << res << " num_fds: "<< num_fds << std::endl;
 		if (res != CURLM_OK) {
             AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_poll error: " << curl_multi_strerror(res));
             break;
         }
     }
-//    std::cerr << "Exiting CurlHttpClient::worker_thread() m_exit: " << m_exit << std::endl;
 }
 
 std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<HttpRequest>& request,
@@ -657,7 +651,7 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
     }
 
     auto curlHandle = m_curlHandleContainer.AcquireCurlHandle();
-    auto connectionHandle = curlHandle.curl.get();
+    auto connectionHandle = curlHandle->curl.get();
 
     if (connectionHandle)
     {
@@ -673,12 +667,12 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
 
 
         auto requestCtx = std::make_shared<RequestCtx>(this, connectionHandle, request, response, readLimiter, writeLimiter);
-        curlHandle.ctx = requestCtx;
+        curlHandle->ctx = requestCtx.get();
         curl_easy_setopt(connectionHandle, CURLOPT_URL, url.c_str());
         curl_easy_setopt(connectionHandle, CURLOPT_WRITEFUNCTION, WriteData);
-        curl_easy_setopt(connectionHandle, CURLOPT_WRITEDATA, curlHandle.ctx.get());
+        curl_easy_setopt(connectionHandle, CURLOPT_WRITEDATA, requestCtx.get());
         curl_easy_setopt(connectionHandle, CURLOPT_HEADERFUNCTION, WriteHeader);
-        curl_easy_setopt(connectionHandle, CURLOPT_HEADERDATA, curlHandle.ctx.get());
+        curl_easy_setopt(connectionHandle, CURLOPT_HEADERDATA, requestCtx.get());
 
         //we only want to override the default path if someone has explicitly told us to.
         if(!m_caPath.empty())
@@ -768,18 +762,18 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
         if (request->GetContentBody())
         {
             curl_easy_setopt(connectionHandle, CURLOPT_READFUNCTION, ReadBody);
-            curl_easy_setopt(connectionHandle, CURLOPT_READDATA, curlHandle.ctx.get());
+            curl_easy_setopt(connectionHandle, CURLOPT_READDATA, requestCtx.get());
             curl_easy_setopt(connectionHandle, CURLOPT_SEEKFUNCTION, SeekBody);
-            curl_easy_setopt(connectionHandle, CURLOPT_SEEKDATA, curlHandle.ctx.get());
+            curl_easy_setopt(connectionHandle, CURLOPT_SEEKDATA, requestCtx.get());
             if (request->IsEventStreamRequest())
             {
                 curl_easy_setopt(connectionHandle, CURLOPT_NOPROGRESS, 0L);
 #if LIBCURL_VERSION_NUM >= 0x072000 // 7.32.0
                 curl_easy_setopt(connectionHandle, CURLOPT_XFERINFOFUNCTION, CurlProgressCallback);
-                curl_easy_setopt(connectionHandle, CURLOPT_XFERINFODATA, curlHandle.ctx.get());
+                curl_easy_setopt(connectionHandle, CURLOPT_XFERINFODATA, requestCtx.get());
 #else
                 curl_easy_setopt(connectionHandle, CURLOPT_PROGRESSFUNCTION, CurlProgressCallback);
-                curl_easy_setopt(connectionHandle, CURLOPT_PROGRESSDATA, curlHandle.ctx.get());
+                curl_easy_setopt(connectionHandle, CURLOPT_PROGRESSDATA, requestCtx.get());
 #endif
             }
         }
@@ -787,13 +781,12 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
         OverrideOptionsOnConnectionHandle(connectionHandle);
         Aws::Utils::DateTime startTransmissionTime = Aws::Utils::DateTime::Now();
 
-        curl_easy_setopt(connectionHandle, CURLOPT_PRIVATE, &requestCtx->promise);
+        curl_easy_setopt(connectionHandle, CURLOPT_PRIVATE, requestCtx.get());
         {
             std::lock_guard<std::mutex> lck(m_mtx);
             m_multiQ.push(connectionHandle);
         }
         curl_multi_wakeup(m_multi);
-
         auto future = requestCtx->promise.get_future();
         CURLcode curlResponseCode = future.get();//curl_easy_perform(connectionHandle);
 
@@ -871,7 +864,8 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
         {
             request->SetResolvedRemoteHost(ip);
         }
-        curlHandle.ctx.reset();
+
+        curlHandle->ctx = nullptr;
         if (curlResponseCode != CURLE_OK)
         {
             m_curlHandleContainer.DestroyCurlHandle(curlHandle);

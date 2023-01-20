@@ -6,6 +6,7 @@
 #include <aws/core/http/curl/CurlHandleContainer.h>
 #include <aws/core/utils/logging/LogMacros.h>
 
+#include <iostream>
 #include <algorithm>
 
 using namespace Aws::Utils::Logging;
@@ -28,14 +29,14 @@ CurlHandleContainer::CurlHandleContainer(unsigned maxSize, long httpRequestTimeo
 CurlHandleContainer::~CurlHandleContainer()
 {
     AWS_LOGSTREAM_INFO(CURL_HANDLE_CONTAINER_TAG, "Cleaning up CurlHandleContainer.");
-    for (auto&& handle : m_handleContainer.ShutdownAndWait(m_poolSize))
+    for (CurlHandle* handle : m_handleContainer.ShutdownAndWait(m_poolSize))
     {
-        AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Cleaning up " << handle.curl.get());
-        handle.curl.reset();
+        AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Cleaning up " << handle->curl.get());
+        delete handle;
     }
 }
 
-CurlHandle CurlHandleContainer::AcquireCurlHandle()
+CurlHandle* CurlHandleContainer::AcquireCurlHandle()
 {
     AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Attempting to acquire curl connection.");
 
@@ -47,32 +48,37 @@ CurlHandle CurlHandleContainer::AcquireCurlHandle()
 
     auto handle = m_handleContainer.Acquire();
     AWS_LOGSTREAM_INFO(CURL_HANDLE_CONTAINER_TAG, "Connection has been released. Continuing.");
-    AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Returning connection handle " << handle.curl.get());
+    AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Returning connection handle " << handle->curl.get());
+
+
     return handle;
 }
 
-void CurlHandleContainer::ReleaseCurlHandle(CurlHandle handle)
+void CurlHandleContainer::ReleaseCurlHandle(CurlHandle* handle)
 {
-    if (handle.curl)
+    if (handle)
     {
-        CURL* curl = handle.curl.get();
-        curl_easy_reset(curl);
-        SetDefaultOptionsOnHandle(curl);
-        AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Releasing curl handle " << curl);
+        if (handle->curl) {
+            CURL* curl = handle->curl.get();
+            curl_easy_reset(curl);
+            SetDefaultOptionsOnHandle(curl);
+            AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Releasing curl handle " << curl);
+        }
         m_handleContainer.Release(handle);
         AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Notified waiting threads.");
     }
 }
 
-void CurlHandleContainer::DestroyCurlHandle(CurlHandle handle)
+void CurlHandleContainer::DestroyCurlHandle(CurlHandle* handle)
 {
-    if (!handle.curl)
+    if (!handle)
     {
         return;
     }
 
-    handle.curl.reset();
-    AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Destroy curl handle: " << handle.curl.get());
+    delete handle;
+
+    AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Destroy curl handle: " << handle->curl.get());
     {
         std::lock_guard<std::mutex> locker(m_containerLock);
         // Other threads could be blocked and waiting on m_handleContainer.Acquire()
@@ -80,21 +86,21 @@ void CurlHandleContainer::DestroyCurlHandle(CurlHandle handle)
         // Create a new handle and release that into the pool
         handle = CreateCurlHandleInPool();
     }
-    if (handle.curl)
+    if (handle->curl)
     {
-        AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Created replacement handle and released to pool: " << handle.curl.get());
+        AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Created replacement handle and released to pool: " << handle->curl.get());
     }
 }
 
 
-CurlHandle CurlHandleContainer::CreateCurlHandleInPool()
+CurlHandle* CurlHandleContainer::CreateCurlHandleInPool()
 {
-    CurlHandle handle;
-    handle.curl = std::shared_ptr<CURL>{curl_easy_init(), CurlHandleDeleter{}};
+    CurlHandle* handle = new CurlHandle();
+    handle->curl = std::shared_ptr<CURL>{curl_easy_init(), CurlHandleDeleter{}};
 
-    if (handle.curl)
+    if (handle->curl)
     {
-        SetDefaultOptionsOnHandle(handle.curl.get());
+        SetDefaultOptionsOnHandle(handle->curl.get());
         m_handleContainer.Release(handle);
     }
     else
@@ -118,7 +124,7 @@ bool CurlHandleContainer::CheckAndGrowPool()
         {
             auto curlHandle = CreateCurlHandleInPool();
 
-            if (curlHandle.curl)
+            if (curlHandle->curl)
             {
                 ++actuallyAdded;
             }
@@ -144,7 +150,6 @@ void CurlHandleContainer::SetDefaultOptionsOnHandle(CURL* handle)
     //for timeouts to work in a multi-threaded context,
     //always turn signals off. This also forces dns queries to
     //not be included in the timeout calculations.
-    curl_easy_reset(handle);
     curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, m_httpRequestTimeout);
     curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, m_connectTimeout);

@@ -535,14 +535,14 @@ CurlHttpClient::CurlHttpClient(const ClientConfiguration& clientConfig) :
     }
 
     m_multi = curl_multi_init();
-    m_thread = std::thread([this]() { this->worker_thread(); });
+    //m_thread = std::thread([this]() { this->worker_thread(); });
 }
 
 CurlHttpClient::~CurlHttpClient()
 {
-    m_exit.store(true);
-    if (m_multi) curl_multi_wakeup(m_multi);
-    if (m_thread.joinable()) m_thread.join();
+//    m_exit.store(true);
+//    if (m_multi) curl_multi_wakeup(m_multi);
+//    if (m_thread.joinable()) m_thread.join();
     if (m_multi) curl_multi_cleanup(m_multi);
 }
 
@@ -594,12 +594,12 @@ std::shared_ptr<curl_slist> MakeRequestHeaders(const std::shared_ptr<HttpRequest
 }
 
 
-void CurlHttpClient::worker_thread() noexcept
+void CurlHttpClient::worker_thread() const noexcept
 {
     int still_running = 0;
     int msgs_left = 0;
     int num_fds = 0;
-    while (!m_exit.load() || still_running) {
+//    while (!m_exit.load() || still_running) {
         {
             std::lock_guard<std::mutex> lck(m_mtx);
             while (!m_multiQ.empty()) {
@@ -611,12 +611,12 @@ void CurlHttpClient::worker_thread() noexcept
         auto res = curl_multi_perform(m_multi, &still_running);
     	if (res != CURLM_OK) {
             AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_perform error: " << curl_multi_strerror(res));
-            break;
+            return;
         }
-        if (m_exit && !still_running) break;
+//        if (m_exit && !still_running) break;
 
         CURLMsg* msg;
-         while((msg = curl_multi_info_read(m_multi, &msgs_left))) {
+        while((msg = curl_multi_info_read(m_multi, &msgs_left))) {
             if(msg->msg == CURLMSG_DONE) {
                 CURL *e = msg->easy_handle;
                 CURLcode result = msg->data.result;
@@ -630,9 +630,9 @@ void CurlHttpClient::worker_thread() noexcept
         res = curl_multi_poll(m_multi, NULL, 0, 1000, &num_fds);
 		if (res != CURLM_OK) {
             AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_poll error: " << curl_multi_strerror(res));
-            break;
+            return;
         }
-    }
+//    }
 }
 
 std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<HttpRequest>& request,
@@ -786,8 +786,22 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
             std::lock_guard<std::mutex> lck(m_mtx);
             m_multiQ.push(connectionHandle);
         }
-        curl_multi_wakeup(m_multi);
+
         auto future = requestCtx->promise.get_future();
+
+        do {
+            if (m_mtxr.try_lock()) {
+                std::lock_guard<std::recursive_mutex> rk(m_mtxr);
+                //now lock_guard owns it
+                m_mtxr.unlock();
+                do {
+                    worker_thread();
+                } while (std::future_status::ready != future.wait_for(std::chrono::seconds(0)));
+            } else {
+                curl_multi_wakeup(m_multi);
+            }
+        } while (std::future_status::ready != future.wait_for(std::chrono::milliseconds(100)));
+
         CURLcode curlResponseCode = future.get();//curl_easy_perform(connectionHandle);
 
         bool shouldContinueRequest = ContinueRequest(*request);

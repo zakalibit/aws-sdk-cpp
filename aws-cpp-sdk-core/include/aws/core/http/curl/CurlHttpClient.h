@@ -76,9 +76,10 @@ private:
     CURLM* m_multi = NULL;
     std::atomic<bool> m_exit{false};
     mutable std::mutex m_mtx;
+    mutable std::recursive_mutex m_mtxr;
     mutable std::queue<CURL*> m_multiQ;
 
-    void worker_thread() noexcept;
+    void worker_thread() const noexcept;
 };
 
 using PlatformHttpClient = CurlHttpClient;

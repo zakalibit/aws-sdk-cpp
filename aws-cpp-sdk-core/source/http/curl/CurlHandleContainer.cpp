@@ -43,7 +43,7 @@ CURL* CurlHandleContainer::AcquireCurlHandle()
     }
 
     CURL* handle = m_handleContainer.Acquire();
-    AWS_LOGSTREAM_INFO(CURL_HANDLE_CONTAINER_TAG, "Connection has been released. Continuing.");
+    AWS_LOGSTREAM_INFO(CURL_HANDLE_CONTAINER_TAG, "Connection has been acquired. Continuing.");
     AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Returning connection handle " << handle);
     return handle;
 }
@@ -54,9 +54,9 @@ void CurlHandleContainer::ReleaseCurlHandle(CURL* handle)
     {
         curl_easy_reset(handle);
         SetDefaultOptionsOnHandle(handle);
-        AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Releasing curl handle " << handle);
         m_handleContainer.Release(handle);
-        AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Notified waiting threads.");
+        AWS_LOGSTREAM_INFO(CURL_HANDLE_CONTAINER_TAG, "Connection has been released. Continuing.");
+        AWS_LOGSTREAM_DEBUG(CURL_HANDLE_CONTAINER_TAG, "Releasing curl handle " << handle);
     }
 }
 

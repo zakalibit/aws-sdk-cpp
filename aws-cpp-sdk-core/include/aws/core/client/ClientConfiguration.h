@@ -115,6 +115,7 @@ namespace Aws
              * No-op for WinHTTP, WinINet and IXMLHTTPRequest2 client.
              */
             bool enableTcpKeepAlive = true;
+            bool enableCurlMulti = false;
             /**
              * Interval to send a keep-alive packet over the connection. Default 30 seconds. Minimum 15 seconds.
              * WinHTTP & libcurl support this option. Note that for Curl, this value will be rounded to an integer with second granularity.

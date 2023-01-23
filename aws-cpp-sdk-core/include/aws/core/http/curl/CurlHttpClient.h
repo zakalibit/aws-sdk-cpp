@@ -71,6 +71,7 @@ private:
     static std::atomic<bool> isInit;
 
 
+    bool m_enableCurlMulti = false;
     CURLM* m_multi = NULL;
     mutable std::mutex m_mtxQ;
     mutable std::recursive_mutex m_mtxR;

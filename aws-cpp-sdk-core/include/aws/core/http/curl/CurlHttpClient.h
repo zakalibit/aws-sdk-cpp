@@ -74,7 +74,7 @@ private:
     bool m_enableCurlMulti = false;
     CURLM* m_multi = NULL;
     mutable std::mutex m_mtxQ;
-    mutable std::recursive_mutex m_mtxR;
+    mutable std::recursive_timed_mutex m_mtxR;
     mutable std::queue<CURL*> m_multiQ;
 
     void multi_reactor() const noexcept;

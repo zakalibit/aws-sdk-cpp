@@ -801,17 +801,17 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
             }
 
             do {
-                if (m_mtxR.try_lock()) {
-                    std::lock_guard<std::recursive_mutex> rk(m_mtxR);
+                curl_multi_wakeup(m_multi);
+                if (m_mtxR.try_lock_for(std::chrono::milliseconds(50))) {
+                    std::lock_guard<std::recursive_timed_mutex> rk(m_mtxR);
                     //now lock_guard owns it
                     m_mtxR.unlock();
                     do {
                         multi_reactor();
                     } while (std::future_status::ready != future.wait_for(std::chrono::seconds(0)));
-                } else {
-                    curl_multi_wakeup(m_multi);
+                    break;
                 }
-            } while (std::future_status::ready != future.wait_for(std::chrono::milliseconds(100)));
+            } while (std::future_status::ready != future.wait_for(std::chrono::milliseconds(50)));
 
             curlResponseCode = future.get();
         } else {

@@ -13,6 +13,7 @@
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include <atomic>
 #include <queue>
+#include <thread>
 
 namespace Aws
 {
@@ -72,12 +73,17 @@ private:
 
 
     bool m_enableCurlMulti = false;
+
+    std::atomic<bool> m_exit{false};
+    std::thread m_thread;
+
     CURLM* m_multi = NULL;
     mutable std::mutex m_mtxQ;
     mutable std::recursive_timed_mutex m_mtxR;
     mutable std::queue<CURL*> m_multiQ;
 
-    void multi_reactor() const noexcept;
+    bool multi_reactor() const noexcept;
+    void threaded_multi_reactor() const noexcept;
 };
 
 using PlatformHttpClient = CurlHttpClient;

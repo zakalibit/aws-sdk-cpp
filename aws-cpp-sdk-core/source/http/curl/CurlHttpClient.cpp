@@ -561,14 +561,18 @@ CurlHttpClient::CurlHttpClient(const ClientConfiguration& clientConfig) :
     }
 
     m_multi = curl_multi_init();
+    m_thread = std::thread([this]() { this->threaded_multi_reactor(); });
 }
 
 CurlHttpClient::~CurlHttpClient()
 {
+    m_exit.store(true);
+    if (m_multi) curl_multi_wakeup(m_multi);
+    if (m_thread.joinable()) m_thread.join();
     if (m_multi) curl_multi_cleanup(m_multi);
 }
 
-void CurlHttpClient::multi_reactor() const noexcept
+bool CurlHttpClient::multi_reactor() const noexcept
 {
     int still_running = 0;
     int msgs_left = 0;
@@ -586,7 +590,7 @@ void CurlHttpClient::multi_reactor() const noexcept
     auto res = curl_multi_perform(m_multi, &still_running);
     if (res != CURLM_OK) {
         AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_perform error: " << curl_multi_strerror(res));
-        return;
+        return false;
     }
 
     CURLMsg* msg;
@@ -604,8 +608,19 @@ void CurlHttpClient::multi_reactor() const noexcept
     res = curl_multi_poll(m_multi, NULL, 0, 1000, &num_fds);
 	if (res != CURLM_OK) {
         AWS_LOGSTREAM_ERROR(CURL_HTTP_CLIENT_TAG, "curl_multi_poll error: " << curl_multi_strerror(res));
-        return;
+        return false;
     }
+
+    return still_running > 0;
+}
+
+void CurlHttpClient::threaded_multi_reactor() const noexcept
+{
+    bool still_running = false;
+    while (!m_exit || still_running) {
+        still_running = multi_reactor();
+    }
+
 }
 
 std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<HttpRequest>& request,
@@ -800,6 +815,8 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
                 m_multiQ.push(connectionHandle);
             }
 
+            curl_multi_wakeup(m_multi);
+/*
             do {
                 curl_multi_wakeup(m_multi);
                 if (m_mtxR.try_lock_for(std::chrono::milliseconds(50))) {
@@ -812,7 +829,7 @@ std::shared_ptr<HttpResponse> CurlHttpClient::MakeRequest(const std::shared_ptr<
                     break;
                 }
             } while (std::future_status::ready != future.wait_for(std::chrono::milliseconds(50)));
-
+*/
             curlResponseCode = future.get();
         } else {
             curlResponseCode = curl_easy_perform(connectionHandle);
